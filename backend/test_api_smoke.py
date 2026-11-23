@@ -91,9 +91,12 @@ def test_smoke_ask_carrier_delayed():
     assert "answer" in data and isinstance(data["answer"], str) and len(data["answer"]) > 0
     assert "supporting_data" in data and isinstance(data["supporting_data"], list)
     assert "engine" in data
-    assert data["engine"] in ["gemini-3.8-flash", "deterministic_fallback"]
+    assert "text-to-sql" in data["engine"]
+    assert "generated_sql" in data and data["generated_sql"] is not None
+    assert data["generated_sql"].strip().upper().startswith("SELECT")
+    assert "sql_rows" in data and isinstance(data["sql_rows"], list)
     print("\nAsk response answer:", data["answer"])
-    print("Supporting data:", data["supporting_data"])
+    print("Generated SQL:", data["generated_sql"])
     print("Engine:", data["engine"])
 
 
@@ -105,6 +108,8 @@ def test_smoke_ask_least_delayed_carrier():
     data = response.json()
     assert "CMA CGM" in data["answer"]
     assert "0.82" in data["answer"]
+    assert data["generated_sql"] is not None
+    assert "ORDER BY" in data["generated_sql"].upper()
 
 
 def test_smoke_ask_specific_carrier():
@@ -115,6 +120,25 @@ def test_smoke_ask_specific_carrier():
     data = response.json()
     assert "MAERSK" in data["answer"]
     assert "53.97%" in data["answer"]
+
+
+def test_database_seed_and_query():
+    """Verify DatabaseManager table creation, seeding, and safe SQL execution."""
+    from backend.database import get_db_manager
+    from backend.data_service import get_data_service
+
+    ds = get_data_service()
+    db = get_db_manager()
+    seeded = db.seed_data(ds.get_df())
+    assert seeded is True
+
+    rows, cols = db.execute_sql("SELECT COUNT(*) AS total FROM shipments;")
+    assert len(rows) == 1
+    assert rows[0]["total"] == 500
+
+    # Test read-only security enforcement
+    with pytest.raises(ValueError):
+        db.execute_sql("DROP TABLE shipments;")
 
 
 def test_smoke_frontend_serving():

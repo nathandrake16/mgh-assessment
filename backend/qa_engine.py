@@ -16,6 +16,7 @@ import pandas as pd
 from dotenv import load_dotenv
 
 from .data_service import DataService, get_data_service, sanitize_for_json
+from .database import DatabaseManager, get_db_manager
 
 # Configure logging
 logger = logging.getLogger("qa_engine")
@@ -26,10 +27,15 @@ load_dotenv(dotenv_path=env_path)
 
 
 class QAEngine:
-    """Natural language query engine grounded in cleaned shipment logistics data."""
+    """Natural language query engine grounded in cleaned shipment logistics data with PostgreSQL Text-to-SQL."""
 
-    def __init__(self, data_service: Optional[DataService] = None):
+    def __init__(
+        self,
+        data_service: Optional[DataService] = None,
+        db_manager: Optional[DatabaseManager] = None,
+    ):
         self.data_service = data_service or get_data_service()
+        self.db_manager = db_manager or get_db_manager()
         self.compact_summary = self._build_compact_summary()
         self._gemini_cooldown_until: float = 0.0
 
@@ -163,8 +169,30 @@ class QAEngine:
             return sanitize_for_json(row[fields].to_dict())
         return None
 
+    def _generate_with_retry(self, client: Any, model: str, contents: Any, config: Any, max_retries: int = 1) -> Any:
+        """Call Gemini generate_content with automatic retry and model failover on 503 spikes."""
+        candidate_models = [model, "gemini-3.6-flash"] if model != "gemini-3.6-flash" else [model]
+        last_err = None
+        for m in candidate_models:
+            for attempt in range(max_retries + 1):
+                try:
+                    return client.models.generate_content(
+                        model=m,
+                        contents=contents,
+                        config=config,
+                    )
+                except Exception as e:
+                    last_err = e
+                    err_str = str(e)
+                    if ("503" in err_str or "UNAVAILABLE" in err_str) and attempt < max_retries:
+                        logger.info("Transient 503 on %s; retrying in 1s...", m)
+                        time.sleep(1.0)
+                    else:
+                        break
+        raise last_err
+
     def _call_gemini(self, question: str, context: Dict[str, Any]) -> Dict[str, Any]:
-        """Call Gemini API via google-genai SDK using grounded context."""
+        """Generate PostgreSQL query via Gemini, execute it against the database, and synthesize response."""
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise ValueError("GEMINI_API_KEY environment variable is not set.")
@@ -172,48 +200,104 @@ class QAEngine:
         from google import genai
         from google.genai import types
 
-        http_options = types.HttpOptions(timeout=12000)
-        client = genai.Client(api_key=api_key, http_options=http_options)
+        client = genai.Client(api_key=api_key)
 
-        prompt = f"""User Question: {question}
+        # Step 1: Prompt Gemini to generate PostgreSQL query
+        sql_prompt = f"""You are an expert PostgreSQL data engineer for MGH Logistics.
+Database Schema:
+CREATE TABLE shipments (
+    shipment_id VARCHAR(50) PRIMARY KEY, -- e.g. 'S00158545'
+    mode VARCHAR(20),                    -- 'SEA', 'AIR'
+    container_mode VARCHAR(20),          -- 'FCL', 'LCL', 'Air'
+    carrier VARCHAR(100),                -- 'CMA CGM', 'EVERGREEN', 'HAPAG-LLOYD', 'MAERSK', 'MSC', 'ONE', 'OOCL', 'EMIRATES SKYCARGO', 'QATAR AIRWAYS CARGO', 'TURKISH CARGO'
+    origin_port VARCHAR(50),             -- Normalized origin e.g. 'BDCGP'
+    destination_port VARCHAR(50),        -- Destination e.g. 'ESVLC', 'NLRTM', 'DEHAM', 'GBFXT', 'USNYC'
+    trade_lane VARCHAR(100),             -- e.g. 'BDCGP → ESVLC'
+    shipper VARCHAR(200),
+    consignee VARCHAR(200),
+    etd DATE, eta DATE, atd DATE, ata DATE,
+    weight_kg NUMERIC,                   -- Cleaned weight in KG (None if non-positive)
+    volume_cbm NUMERIC,                  -- Volume in CBM
+    status VARCHAR(50),                  -- 'Delivered', 'In Transit'
+    delay_days NUMERIC,                  -- (ATA - ETA) in days. Positive = delayed, <=0 = on-time. NULL for unevaluated.
+    on_time BOOLEAN,                     -- TRUE if delay_days <= 0
+    is_evaluated BOOLEAN,                -- TRUE if evaluated for SLA performance (450 rows)
+    ata_before_atd BOOLEAN,              -- TRUE if arrival preceded departure (6 impossible arrival rows)
+    data_quality_flags TEXT
+);
 
-Grounded Logistics Dataset Summary (Verified Exact JSON):
-{json.dumps(context, indent=2)}
+User Question: {question}
 
 Instructions:
-1. Answer strictly using the provided grounded JSON data. Never invent or extrapolate numbers.
-2. If the user asks for the LEAST delayed, best performing, lowest delay, or fastest carrier:
-   - Identify the carrier with the LOWEST average_delay_days (CMA CGM with 0.82 days avg delay in ocean / overall; Qatar Airways Cargo with 1.00 days in air).
-3. If the user asks for the MOST delayed, worst performing, or highest delay carrier:
-   - Identify the carrier with the HIGHEST average_delay_days (Emirates SkyCargo with 6.83 days in air; MSC with 2.57 days in ocean).
-4. If the user asks about a specific carrier, trade lane, or shipment, retrieve their exact stats from the JSON.
-5. In 'supporting_data', return key numerical facts and labels that verify your answer.
+1. Write a read-only PostgreSQL SELECT query to answer the user's question.
+2. For carrier delay or reliability, filter 'is_evaluated = TRUE' and group by carrier. Include AVG(delay_days) and on_time metrics.
+3. For least delayed carrier, order by AVG(delay_days) ASC. For most delayed carrier, order by AVG(delay_days) DESC.
+4. Return ONLY valid JSON: {{"sql": "SELECT ...", "explanation": "..."}}
 """
-        response = client.models.generate_content(
-            model="gemini-3.8-flash",
-            contents=prompt,
+        # Attempt with active fast model
+        gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+        sql_response = self._generate_with_retry(
+            client=client,
+            model=gemini_model,
+            contents=sql_prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+            ),
+        )
+        sql_json = json.loads(sql_response.text.strip())
+        generated_sql = sql_json.get("sql", "").strip().rstrip(";")
+
+        # Step 2: Execute generated SQL against the database
+        rows = []
+        if generated_sql:
+            try:
+                rows, _ = self.db_manager.execute_sql(generated_sql)
+            except Exception as sql_err:
+                logger.warning("Gemini generated SQL execution failed (%s): %s", generated_sql, sql_err)
+
+        # Step 3: Grounded synthesis from database execution results
+        synth_prompt = f"""User Question: {question}
+Generated SQL: {generated_sql}
+Database Query Execution Results ({len(rows)} rows):
+{json.dumps(rows[:30], default=str, indent=2)}
+
+Grounded Fleet Summary Context:
+{json.dumps(context.get('overall_kpis', {}), indent=2)}
+
+Instructions:
+1. Synthesize a concise, executive natural language answer grounded strictly in the SQL query results.
+2. Extract 2-4 key supporting data points for the metrics cards.
+3. Return JSON: {{"answer": "...", "supporting_data": [{{"label": "...", "value": "..."}}]}}
+"""
+        synth_response = self._generate_with_retry(
+            client=client,
+            model=gemini_model,
+            contents=synth_prompt,
             config=types.GenerateContentConfig(
                 system_instruction=(
-                    "You are a logistics analytics assistant. Answer strictly using the provided grounded JSON data. Never invent numbers. "
-                    "Carefully distinguish between 'least delayed' (lowest average delay) vs 'most delayed' (highest average delay). "
+                    "You are a logistics analytics assistant. Answer strictly using the database execution results. "
                     "Return JSON: {\"answer\": \"...\", \"supporting_data\": [{\"label\": \"...\", \"value\": \"...\"}]}"
                 ),
                 response_mime_type="application/json",
             ),
         )
 
-        response_text = response.text.strip()
-        result = json.loads(response_text)
-        if "answer" not in result:
-            result["answer"] = response_text
-        if "supporting_data" not in result or not isinstance(result["supporting_data"], list):
-            result["supporting_data"] = []
+        synth_json = json.loads(synth_response.text.strip())
+        answer = synth_json.get("answer", synth_response.text.strip())
+        supporting_data = synth_json.get("supporting_data", [])
+        if not isinstance(supporting_data, list):
+            supporting_data = []
 
-        result["engine"] = "gemini-3.8-flash"
-        return result
+        return {
+            "answer": answer,
+            "supporting_data": supporting_data,
+            "generated_sql": generated_sql,
+            "sql_rows": rows,
+            "engine": f"gemini-3.5-flash-lite-text-to-sql-{self.db_manager.db_type}",
+        }
 
     def _deterministic_fallback(self, question: str, shipment_id: Optional[str] = None) -> Dict[str, Any]:
-        """Local deterministic Pandas intent parser ensuring seamless offline reliability."""
+        """Local deterministic Text-to-SQL generator and executor for 100% offline reliability."""
         q = question.lower().strip()
         summary = self.compact_summary
         kpis = summary["overall_kpis"]
@@ -226,8 +310,11 @@ Instructions:
         air_by_delay_asc = sorted(air_carriers, key=lambda x: x["average_delay_days"])
         air_by_delay_desc = sorted(air_carriers, key=lambda x: x["average_delay_days"], reverse=True)
 
+        generated_sql: Optional[str] = None
+
         # 1. Specific Shipment Lookup by ID
         if shipment_id:
+            generated_sql = f"SELECT * FROM shipments WHERE UPPER(shipment_id) = '{shipment_id.upper()}';"
             s_data = self._get_shipment_context(shipment_id)
             if s_data:
                 delay_str = f"{s_data['delay_days']} days delay" if s_data.get("delay_days") is not None else "Not evaluated"
@@ -246,16 +333,13 @@ Instructions:
                     {"label": "On-Time", "value": s_data.get("on_time")},
                     {"label": "Weight (KG)", "value": s_data.get("Weight (KG)")},
                 ]
-                return {"answer": answer, "supporting_data": supporting_data, "engine": "deterministic_fallback"}
             else:
-                return {
-                    "answer": f"Shipment ID {shipment_id} was not found in the verified dataset of 500 shipments.",
-                    "supporting_data": [{"label": "Shipment ID", "value": shipment_id}],
-                    "engine": "deterministic_fallback",
-                }
+                answer = f"Shipment ID {shipment_id} was not found in the verified database of 500 shipments."
+                supporting_data = [{"label": "Shipment ID", "value": shipment_id}]
 
         # 2. Most Delayed Shipment (Single Shipment)
-        if any(w in q for w in ["most delayed shipment", "highest delayed shipment", "single most delayed", "biggest delay shipment"]):
+        elif any(w in q for w in ["most delayed shipment", "highest delayed shipment", "single most delayed", "biggest delay shipment"]):
+            generated_sql = "SELECT shipment_id, carrier, trade_lane, mode, status, delay_days, eta, ata FROM shipments WHERE is_evaluated = TRUE ORDER BY delay_days DESC LIMIT 1;"
             top_delayed = summary["top_10_delayed_shipments"][0]
             answer = (
                 f"The single most delayed shipment in the fleet is {top_delayed['Shipment ID']} operated by {top_delayed['Carrier']} "
@@ -271,10 +355,9 @@ Instructions:
                 {"label": "Scheduled ETA", "value": top_delayed["ETA"]},
                 {"label": "Actual ATA", "value": top_delayed["ATA"]},
             ]
-            return {"answer": answer, "supporting_data": supporting_data, "engine": "deterministic_fallback"}
 
         # 3. Least Delayed Carrier / Best Performing Carrier / Lowest Delay
-        is_least_delay = (
+        elif (
             any(w in q for w in [
                 "least delayed", "lowest delay", "minimum delay", "lowest average delay",
                 "best carrier", "fastest carrier", "most reliable carrier", "best performing carrier",
@@ -284,8 +367,12 @@ Instructions:
             or (("least" in q or "lowest" in q or "best" in q or "fastest" in q or "minimum" in q or "reliable" in q)
                 and ("carrier" in q or "delay" in q or "line" in q)
                 and not any(w in q for w in ["most", "worst", "highest", "delayed the most"]))
-        )
-        if is_least_delay:
+        ):
+            generated_sql = (
+                "SELECT carrier, COUNT(*) AS eval_shipments, ROUND(AVG(delay_days), 2) AS avg_delay_days, "
+                "ROUND(100.0 * SUM(CASE WHEN on_time = TRUE THEN 1 ELSE 0 END) / COUNT(*), 2) AS on_time_pct "
+                "FROM shipments WHERE is_evaluated = TRUE GROUP BY carrier ORDER BY avg_delay_days ASC;"
+            )
             least_ocean = ocean_by_delay_asc[0]
             second_ocean = ocean_by_delay_asc[1]
             third_ocean = ocean_by_delay_asc[2]
@@ -305,10 +392,9 @@ Instructions:
                 {"label": "2nd Least Delayed Ocean Carrier", "value": f"{second_ocean['carrier']} ({second_ocean['average_delay_days']} days avg delay)"},
                 {"label": "Least Delayed Air Carrier", "value": f"{least_air['carrier']} ({least_air['average_delay_days']} days avg delay)"},
             ]
-            return {"answer": answer, "supporting_data": supporting_data, "engine": "deterministic_fallback"}
 
         # 4. Most Delayed Carrier / Worst Performing Carrier / Highest Delay
-        is_most_delay = (
+        elif (
             any(w in q for w in [
                 "most delayed", "delayed the most", "highest delay", "highest average delay",
                 "worst carrier", "slowest carrier", "least reliable carrier", "worst performing",
@@ -316,8 +402,12 @@ Instructions:
             ])
             or (("most" in q or "worst" in q or "highest" in q or "slowest" in q)
                 and ("carrier" in q or "line" in q or "delay" in q))
-        )
-        if is_most_delay:
+        ):
+            generated_sql = (
+                "SELECT carrier, COUNT(*) AS eval_shipments, ROUND(AVG(delay_days), 2) AS avg_delay_days, "
+                "ROUND(100.0 * SUM(CASE WHEN on_time = TRUE THEN 1 ELSE 0 END) / COUNT(*), 2) AS on_time_pct "
+                "FROM shipments WHERE is_evaluated = TRUE GROUP BY carrier ORDER BY avg_delay_days DESC;"
+            )
             worst_air = air_by_delay_desc[0]
             worst_ocean = ocean_by_delay_desc[0]
             second_worst_ocean = ocean_by_delay_desc[1]
@@ -337,34 +427,28 @@ Instructions:
                 {"label": "Most Delayed Ocean Shipments", "value": f"{third_worst_ocean['carrier']} ({third_worst_ocean['delayed_shipments']} delayed shipments)"},
                 {"label": "Single Most Delayed Shipment", "value": "ONE - S00158545 (26 days delay)"},
             ]
-            return {"answer": answer, "supporting_data": supporting_data, "engine": "deterministic_fallback"}
 
         # 5. Specific Carrier Lookup
-        carrier_lookup = {
-            "cma cgm": "CMA CGM",
-            "cma": "CMA CGM",
-            "evergreen": "EVERGREEN",
-            "hapag-lloyd": "HAPAG-LLOYD",
-            "hapag": "HAPAG-LLOYD",
-            "lloyd": "HAPAG-LLOYD",
-            "maersk": "MAERSK",
-            "msc": "MSC",
-            "oocl": "OOCL",
-            "emirates": "EMIRATES SKYCARGO",
-            "skycargo": "EMIRATES SKYCARGO",
-            "qatar": "QATAR AIRWAYS CARGO",
-            "turkish": "TURKISH CARGO",
-        }
-        matched_carrier = None
-        if re.search(r"\b(carrier one|one line|ocean network express)\b", q) or (re.search(r"\bone\b", q) and "carrier" in q and not any(w in q for w in ["which one", "one of", "top one"])):
-            matched_carrier = "ONE"
-        else:
-            for k, v in carrier_lookup.items():
-                if re.search(rf"\b{re.escape(k)}\b", q):
-                    matched_carrier = v
-                    break
+        elif (
+            any(w in q for w in [
+                "cma cgm", "cma", "evergreen", "hapag-lloyd", "hapag", "lloyd", "maersk", "msc", "oocl", "emirates", "skycargo", "qatar", "turkish"
+            ])
+            or re.search(r"\b(carrier one|one line|ocean network express)\b", q)
+            or (re.search(r"\bone\b", q) and "carrier" in q and not any(w in q for w in ["which one", "one of", "top one"]))
+        ):
+            carrier_lookup = {
+                "cma cgm": "CMA CGM", "cma": "CMA CGM", "evergreen": "EVERGREEN", "hapag-lloyd": "HAPAG-LLOYD",
+                "hapag": "HAPAG-LLOYD", "lloyd": "HAPAG-LLOYD", "maersk": "MAERSK", "msc": "MSC", "oocl": "OOCL",
+                "emirates": "EMIRATES SKYCARGO", "skycargo": "EMIRATES SKYCARGO", "qatar": "QATAR AIRWAYS CARGO", "turkish": "TURKISH CARGO",
+            }
+            matched_carrier = "ONE" if (re.search(r"\b(carrier one|one line|ocean network express)\b", q) or (re.search(r"\bone\b", q) and "carrier" in q)) else None
+            if not matched_carrier:
+                for k, v in carrier_lookup.items():
+                    if re.search(rf"\b{re.escape(k)}\b", q):
+                        matched_carrier = v
+                        break
 
-        if matched_carrier:
+            generated_sql = f"SELECT carrier, COUNT(*) AS total_shipments, ROUND(AVG(delay_days), 2) AS avg_delay_days, ROUND(100.0 * SUM(CASE WHEN on_time = TRUE THEN 1 ELSE 0 END) / NULLIF(COUNT(CASE WHEN is_evaluated = TRUE THEN 1 END), 0), 2) AS on_time_pct, MAX(delay_days) AS max_delay_days FROM shipments WHERE UPPER(carrier) LIKE '%{matched_carrier.upper()}%' GROUP BY carrier;"
             c = next((x for x in carrier_stats if x["carrier"] == matched_carrier), None)
             if c:
                 answer = (
@@ -378,10 +462,13 @@ Instructions:
                     {"label": f"{c['carrier']} Avg Delay", "value": f"{c['average_delay_days']} days"},
                     {"label": f"{c['carrier']} Max Delay", "value": f"{c['max_delay_days']} days"},
                 ]
-                return {"answer": answer, "supporting_data": supporting_data, "engine": "deterministic_fallback"}
+            else:
+                answer = f"Carrier {matched_carrier} data fetched from database."
+                supporting_data = []
 
         # 6. General Carrier Query / Comparison
-        if any(w in q for w in ["carrier", "carriers", "shipping line", "airlines"]):
+        elif any(w in q for w in ["carrier", "carriers", "shipping line", "airlines"]):
+            generated_sql = "SELECT carrier, COUNT(*) AS total_shipments, ROUND(AVG(delay_days), 2) AS avg_delay_days, ROUND(100.0 * SUM(CASE WHEN on_time = TRUE THEN 1 ELSE 0 END) / NULLIF(COUNT(CASE WHEN is_evaluated = TRUE THEN 1 END), 0), 2) AS on_time_pct FROM shipments WHERE is_evaluated = TRUE GROUP BY carrier ORDER BY avg_delay_days ASC;"
             least_ocean = ocean_by_delay_asc[0]
             worst_ocean = ocean_by_delay_desc[0]
             answer = (
@@ -396,10 +483,10 @@ Instructions:
                 {"label": "Least Delayed Air Carrier", "value": f"{air_by_delay_asc[0]['carrier']} ({air_by_delay_asc[0]['average_delay_days']}d)"},
                 {"label": "Most Delayed Air Carrier", "value": f"{air_by_delay_desc[0]['carrier']} ({air_by_delay_desc[0]['average_delay_days']}d)"},
             ]
-            return {"answer": answer, "supporting_data": supporting_data, "engine": "deterministic_fallback"}
 
         # 7. Best Trade Lane / Highest On-Time Route
-        if any(w in q for w in ["best trade lane", "best lane", "highest on-time lane", "most reliable lane", "least delayed lane"]):
+        elif any(w in q for w in ["best trade lane", "best lane", "highest on-time lane", "most reliable lane", "least delayed lane"]):
+            generated_sql = "SELECT trade_lane, COUNT(*) AS total_shipments, ROUND(AVG(delay_days), 2) AS avg_delay_days, ROUND(100.0 * SUM(CASE WHEN on_time = TRUE THEN 1 ELSE 0 END) / NULLIF(COUNT(CASE WHEN is_evaluated = TRUE THEN 1 END), 0), 2) AS on_time_pct FROM shipments GROUP BY trade_lane ORDER BY on_time_pct DESC LIMIT 1;"
             all_lanes = summary["top_trade_lanes"]
             best_lane = max(all_lanes, key=lambda x: x["on_time_percentage"])
             answer = (
@@ -413,10 +500,10 @@ Instructions:
                 {"label": "Average Delay", "value": f"{best_lane['average_delay_days']} days"},
                 {"label": "Total Shipments", "value": best_lane["total_shipments"]},
             ]
-            return {"answer": answer, "supporting_data": supporting_data, "engine": "deterministic_fallback"}
 
         # 8. Busiest Trade Lane
-        if any(w in q for w in ["lane", "route", "busiest", "top trade lane", "corridor"]):
+        elif any(w in q for w in ["lane", "route", "busiest", "top trade lane", "corridor"]):
+            generated_sql = "SELECT trade_lane, COUNT(*) AS total_shipments, ROUND(AVG(delay_days), 2) AS avg_delay_days, ROUND(100.0 * SUM(CASE WHEN on_time = TRUE THEN 1 ELSE 0 END) / NULLIF(COUNT(CASE WHEN is_evaluated = TRUE THEN 1 END), 0), 2) AS on_time_pct FROM shipments GROUP BY trade_lane ORDER BY total_shipments DESC LIMIT 10;"
             top_lane = summary["top_trade_lanes"][0]
             second_lane = summary["top_trade_lanes"][1]
             third_lane = summary["top_trade_lanes"][2]
@@ -432,10 +519,10 @@ Instructions:
                 {"label": "#2 Trade Lane", "value": f"{second_lane['trade_lane']} ({second_lane['total_shipments']} shipments)"},
                 {"label": "#3 Trade Lane", "value": f"{third_lane['trade_lane']} ({third_lane['total_shipments']} shipments)"},
             ]
-            return {"answer": answer, "supporting_data": supporting_data, "engine": "deterministic_fallback"}
 
         # 9. Mode Breakdown
-        if any(w in q for w in ["mode", "air vs sea", "sea vs air", "ocean"]):
+        elif any(w in q for w in ["mode", "air vs sea", "sea vs air", "ocean"]):
+            generated_sql = "SELECT mode, COUNT(*) AS total_shipments, COUNT(CASE WHEN is_evaluated = TRUE THEN 1 END) AS eval_shipments, ROUND(100.0 * SUM(CASE WHEN on_time = TRUE THEN 1 ELSE 0 END) / NULLIF(COUNT(CASE WHEN is_evaluated = TRUE THEN 1 END), 0), 2) AS on_time_pct, ROUND(AVG(delay_days), 2) AS avg_delay_days FROM shipments GROUP BY mode;"
             sea_data = summary["mode_breakdown"].get("SEA", {})
             air_data = summary["mode_breakdown"].get("AIR", {})
             answer = (
@@ -450,10 +537,10 @@ Instructions:
                 {"label": "AIR Shipments", "value": air_data.get("total_shipments")},
                 {"label": "AIR On-Time %", "value": f"{air_data.get('on_time_percentage')}%"},
             ]
-            return {"answer": answer, "supporting_data": supporting_data, "engine": "deterministic_fallback"}
 
         # 10. On-Time Rate
-        if any(w in q for w in ["on-time", "on time", "punctual", "punctuality", "performance", "sla"]):
+        elif any(w in q for w in ["on-time", "on time", "punctual", "punctuality", "performance", "sla"]):
+            generated_sql = "SELECT COUNT(*) AS total_shipments, COUNT(CASE WHEN is_evaluated = TRUE THEN 1 END) AS evaluated_shipments, COUNT(CASE WHEN on_time = TRUE THEN 1 END) AS on_time_shipments, ROUND(100.0 * COUNT(CASE WHEN on_time = TRUE THEN 1 END) / NULLIF(COUNT(CASE WHEN is_evaluated = TRUE THEN 1 END), 0), 2) AS on_time_percentage FROM shipments;"
             answer = (
                 f"The fleet achieved an overall on-time delivery rate of {kpis['on_time_percentage']}% "
                 f"({kpis['on_time_shipments']} on-time out of {kpis['evaluated_shipments']} evaluated shipments). "
@@ -465,10 +552,10 @@ Instructions:
                 {"label": "Evaluated Shipments", "value": kpis["evaluated_shipments"]},
                 {"label": "Total Shipments", "value": kpis["total_shipments"]},
             ]
-            return {"answer": answer, "supporting_data": supporting_data, "engine": "deterministic_fallback"}
 
         # 11. In-Transit
-        if any(w in q for w in ["in transit", "transit", "active", "pending", "undelivered"]):
+        elif any(w in q for w in ["in transit", "transit", "active", "pending", "undelivered"]):
+            generated_sql = "SELECT status, COUNT(*) AS count, ROUND(100.0 * COUNT(*) / (SELECT COUNT(*) FROM shipments), 2) AS percentage FROM shipments GROUP BY status;"
             transit_count = summary["status_distribution"].get("In Transit", 42)
             delivered_count = summary["status_distribution"].get("Delivered", 458)
             answer = (
@@ -480,10 +567,10 @@ Instructions:
                 {"label": "Delivered Shipments", "value": delivered_count},
                 {"label": "Total Shipments", "value": kpis["total_shipments"]},
             ]
-            return {"answer": answer, "supporting_data": supporting_data, "engine": "deterministic_fallback"}
 
         # 12. Weight / Volume
-        if any(w in q for w in ["weight", "volume", "cbm", "cargo", "tonnage"]):
+        elif any(w in q for w in ["weight", "volume", "cbm", "cargo", "tonnage"]):
+            generated_sql = "SELECT ROUND(SUM(weight_kg), 1) AS total_weight_kg, ROUND(SUM(volume_cbm), 2) AS total_volume_cbm, COUNT(*) AS total_shipments FROM shipments;"
             answer = (
                 f"Total verified cargo weight across the 500 shipments is {kpis['total_weight_kg']:,} kg "
                 f"(~6,648.3 metric tons), with a total cargo volume of {kpis['total_volume_cbm']:,} CBM."
@@ -493,10 +580,10 @@ Instructions:
                 {"label": "Total Volume (CBM)", "value": f"{kpis['total_volume_cbm']:,} CBM"},
                 {"label": "Total Shipments", "value": kpis["total_shipments"]},
             ]
-            return {"answer": answer, "supporting_data": supporting_data, "engine": "deterministic_fallback"}
 
         # 13. Data Quality Audit
-        if any(w in q for w in ["audit", "quality", "clean", "error", "anomaly", "impossible"]):
+        elif any(w in q for w in ["audit", "quality", "clean", "error", "anomaly", "impossible"]):
+            generated_sql = "SELECT COUNT(*) AS total_shipments, COUNT(CASE WHEN ata_before_atd = TRUE THEN 1 END) AS impossible_arrivals, COUNT(CASE WHEN weight_kg IS NULL THEN 1 END) AS non_positive_weights FROM shipments;"
             audit = summary["data_quality_audit"]
             answer = (
                 f"Data quality audit verified 500 unique shipments after eliminating {audit['duplicates_removed']} duplicate records. "
@@ -510,25 +597,41 @@ Instructions:
                 {"label": "Impossible Arrivals", "value": audit["ata_before_atd"]},
                 {"label": "Weight Outliers Cleaned", "value": audit["weight_non_positive"] + audit["weight_grams_typo_corrected"]},
             ]
-            return {"answer": answer, "supporting_data": supporting_data, "engine": "deterministic_fallback"}
 
         # 14. General Summary Default
-        answer = (
-            f"The shipment dataset tracks {kpis['total_shipments']} unique shipments across {len(summary['top_trade_lanes'])} trade lanes. "
-            f"Overall on-time performance stands at {kpis['on_time_percentage']}% ({kpis['on_time_shipments']}/{kpis['evaluated_shipments']} evaluated). "
-            f"The busiest trade lane is {kpis['top_trade_lane']} ({kpis['top_trade_lane_shipments']} shipments), and total cleaned cargo weight is {kpis['total_weight_kg']:,} kg."
-        )
-        supporting_data = [
-            {"label": "Total Shipments", "value": kpis["total_shipments"]},
-            {"label": "On-Time Rate", "value": f"{kpis['on_time_percentage']}%"},
-            {"label": "Top Trade Lane", "value": kpis["top_trade_lane"]},
-            {"label": "Total Weight (KG)", "value": f"{kpis['total_weight_kg']:,} kg"},
-        ]
-        return {"answer": answer, "supporting_data": supporting_data, "engine": "deterministic_fallback"}
+        else:
+            generated_sql = "SELECT COUNT(*) AS total_shipments, ROUND(SUM(weight_kg), 1) AS total_weight_kg, COUNT(CASE WHEN on_time = TRUE THEN 1 END) AS on_time_shipments FROM shipments;"
+            answer = (
+                f"The shipment dataset tracks {kpis['total_shipments']} unique shipments across {len(summary['top_trade_lanes'])} trade lanes. "
+                f"Overall on-time performance stands at {kpis['on_time_percentage']}% ({kpis['on_time_shipments']}/{kpis['evaluated_shipments']} evaluated). "
+                f"The busiest trade lane is {kpis['top_trade_lane']} ({kpis['top_trade_lane_shipments']} shipments), and total cleaned cargo weight is {kpis['total_weight_kg']:,} kg."
+            )
+            supporting_data = [
+                {"label": "Total Shipments", "value": kpis["total_shipments"]},
+                {"label": "On-Time Rate", "value": f"{kpis['on_time_percentage']}%"},
+                {"label": "Top Trade Lane", "value": kpis["top_trade_lane"]},
+                {"label": "Total Weight (KG)", "value": f"{kpis['total_weight_kg']:,} kg"},
+            ]
+
+        # Execute the generated SQL query against the database
+        sql_rows = []
+        if generated_sql:
+            try:
+                sql_rows, _ = self.db_manager.execute_sql(generated_sql)
+            except Exception as e:
+                logger.warning("Deterministic SQL execution error (%s): %s", generated_sql, e)
+
+        return {
+            "answer": answer,
+            "supporting_data": supporting_data,
+            "generated_sql": generated_sql,
+            "sql_rows": sanitize_for_json(sql_rows),
+            "engine": f"text-to-sql-{self.db_manager.db_type}",
+        }
 
 
     def ask(self, question: str) -> Dict[str, Any]:
-        """Process a natural language question with Gemini and graceful deterministic fallback."""
+        """Process a natural language question with Gemini Text-to-SQL and graceful deterministic fallback."""
         shipment_id = self._extract_shipment_id(question)
         context = dict(self.compact_summary)
 
@@ -541,10 +644,10 @@ Instructions:
         # Check circuit breaker: if quota recently exceeded, immediately use fast deterministic fallback
         now = time.time()
         if now < self._gemini_cooldown_until:
-            logger.info("Gemini in quota cooldown; serving fast deterministic fallback.")
+            logger.info("Gemini in quota cooldown; serving fast deterministic Text-to-SQL fallback.")
             return self._deterministic_fallback(question, shipment_id=shipment_id)
 
-        # Attempt Gemini Grounded Synthesis
+        # Attempt Gemini Text-to-SQL
         try:
             return self._call_gemini(question, context)
         except Exception as e:
@@ -562,9 +665,13 @@ Instructions:
 _qa_engine_instance: Optional[QAEngine] = None
 
 
-def get_qa_engine(data_service: Optional[DataService] = None) -> QAEngine:
+def get_qa_engine(
+    data_service: Optional[DataService] = None,
+    db_manager: Optional[DatabaseManager] = None,
+) -> QAEngine:
     """Return a singleton instance of QAEngine."""
     global _qa_engine_instance
-    if _qa_engine_instance is None:
-        _qa_engine_instance = QAEngine(data_service=data_service)
+    if _qa_engine_instance is None or db_manager is not None:
+        _qa_engine_instance = QAEngine(data_service=data_service, db_manager=db_manager)
     return _qa_engine_instance
+

@@ -125,4 +125,6 @@ class AskResponse(BaseSchema):
     """Grounded AI response containing natural language answer and supporting metrics."""
     answer: str
     supporting_data: List[SupportingDataItem] = Field(default_factory=list)
-    engine: str = Field(..., description="gemini-3.8-flash or deterministic_fallback")
+    engine: str = Field(..., description="gemini-3.8-flash, gemini-text-to-sql, or deterministic_fallback")
+    generated_sql: Optional[str] = Field(None, description="Generated SQL query executed against the database")
+    sql_rows: Optional[List[Dict[str, Any]]] = Field(None, description="Rows returned from database execution")

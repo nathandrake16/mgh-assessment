@@ -14,6 +14,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .data_service import DataService, get_data_service, sanitize_for_json
+from .database import DatabaseManager, get_db_manager
 from .qa_engine import QAEngine, get_qa_engine
 from .schemas import (
     AskRequest,
@@ -26,16 +27,19 @@ from .schemas import (
 
 # Global service singletons
 data_service: Optional[DataService] = None
+db_manager: Optional[DatabaseManager] = None
 qa_engine: Optional[QAEngine] = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load and clean shipment CSV data once at startup."""
-    global data_service, qa_engine
+    """Load and clean shipment CSV data and seed database once at startup."""
+    global data_service, db_manager, qa_engine
     data_service = get_data_service()
-    # Initialize QA engine with cached compact summary
-    qa_engine = get_qa_engine(data_service)
+    db_manager = get_db_manager()
+    db_manager.seed_data(data_service.get_df())
+    # Initialize QA engine with database manager
+    qa_engine = get_qa_engine(data_service, db_manager=db_manager)
     yield
 
 
@@ -226,7 +230,7 @@ def ask_the_data(request: AskRequest) -> Dict[str, Any]:
     if not request.question or not request.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
-    engine = qa_engine or get_qa_engine(data_service)
+    engine = qa_engine or get_qa_engine(data_service, db_manager=db_manager or get_db_manager())
     result = engine.ask(request.question)
     return sanitize_for_json(result)
 

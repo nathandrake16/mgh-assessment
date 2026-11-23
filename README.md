@@ -45,7 +45,7 @@ The data pipeline in [`backend/data_service.py`](backend/data_service.py) enforc
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                       React Frontend                        │
-│             (Vite + Tailwind CSS + Recharts)               │
+│   (Vite + Tailwind CSS + Recharts + Text-to-SQL Preview)    │
 └──────────────────────────────┬──────────────────────────────┘
                                │ HTTP / JSON (Port 8000)
 ┌──────────────────────────────▼──────────────────────────────┐
@@ -55,10 +55,13 @@ The data pipeline in [`backend/data_service.py`](backend/data_service.py) enforc
 │      backend/schemas.py      │       backend/main.py        │
 │  (Strict Response Models)    │  (Lifespan Cache & Endpoints)│
 ├──────────────────────────────┼──────────────────────────────┤
-│    backend/qa_engine.py      │   backend/data_service.py    │
-│  (Gemini 3.8 Flash SDK +     │  (Pandas Ingestion Pipeline, │
-│   Deterministic Fallback)    │   Heuristics & Clean Engine) │
-└──────────────────────────────┴──────────────────────────────┘
+│    backend/qa_engine.py      │    backend/database.py       │
+│  (Gemini Text-to-SQL +       │  (PostgreSQL + SQLAlchemy 2  │
+│   Database Query Execution)  │   + Safe Read-Only Runner)   │
+├──────────────────────────────┴──────────────────────────────┤
+│                   backend/data_service.py                   │
+│  (Pandas Ingestion Pipeline, Heuristics & Data Seeding)     │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ### ADR 1: FastAPI (Python/Pandas) for Logistics Backend
@@ -67,17 +70,18 @@ The data pipeline in [`backend/data_service.py`](backend/data_service.py) enforc
 
 ### ADR 2: SOLID & Separation of Concerns
 - **Data Layer (`backend/data_service.py`):** Encapsulates deduplication, port normalization, heuristic transit window algorithms, and weight unit cleaning.
-- **Contract Layer (`backend/schemas.py`):** Pydantic schemas enforce type safety and decoupling. All fields support both camelCase and original CSV column aliases.
-- **Intelligence Layer (`backend/qa_engine.py`):** Decouples AI query orchestration from core routing logic.
-- **Transport Layer (`backend/main.py`):** Handles HTTP, status codes, query filtering, and lifespan startup caching.
+- **Database Layer (`backend/database.py`):** Manages connection to PostgreSQL via SQLAlchemy 2.0, auto-seeds the cleaned 500 shipments into the `shipments` table, enforces strict read-only execution security (disallowing `DROP`, `DELETE`, `UPDATE`, `INSERT`), and provides a zero-downtime local mirror.
+- **Contract Layer (`backend/schemas.py`):** Pydantic schemas enforce type safety and decoupling. All fields support both camelCase and original CSV column aliases, and includes `generated_sql` and `sql_rows`.
+- **Intelligence Layer (`backend/qa_engine.py`):** Executes an end-to-end Text-to-SQL workflow: Gemini generates an exact PostgreSQL `SELECT` query given the database schema, executes it directly against the database, and synthesizes an executive grounded answer backed by returned rows.
+- **Transport Layer (`backend/main.py`):** Handles HTTP, status codes, query filtering, database seeding on lifespan startup, and SPA static hosting.
 
-### ADR 3: Grounded AI Synthesis with Deterministic Fallback
+### ADR 3: Grounded Text-to-SQL with Deterministic Fallback
 - **Problem:** LLMs are prone to numerical hallucinations when answering open-ended logistical questions.
 - **Solution:** 
-  1. The backend pre-computes an exact, compact JSON summary from verified Pandas aggregations.
-  2. If the user mentions a specific shipment ID (e.g., `S00158545`), that exact record is dynamically injected into the context prompt.
-  3. Uses `google-genai` SDK with `gemini-3.8-flash` and strict JSON output schemas.
-  4. If an API outage, quota limit, or 503 error occurs, the engine seamlessly routes to a **local deterministic Pandas intent parser** returning `"engine": "deterministic_fallback"`.
+  1. **Schema-Aware Text-to-SQL:** Natural language queries are translated into a read-only PostgreSQL `SELECT` query against the `shipments` table.
+  2. **Live Database Execution:** The SQL query is safely executed against the database, returning exact matching rows.
+  3. **Grounded Synthesis:** Gemini synthesizes a concise executive answer grounded directly in the live SQL results.
+  4. **Full Offline Fallback:** If API quotas or network limits are encountered, a deterministic SQL generator produces the exact query, executes it on the database, and returns verified metrics with zero downtime.
 
 ---
 
@@ -127,10 +131,28 @@ npm run dev
 
 ---
 
-### 4.3 Running Test Suite
+### 4.3 PostgreSQL Configuration (Optional)
+The system automatically connects to PostgreSQL if credentials are provided in `backend/.env`. If omitted, it automatically falls back to an internal SQLite mirror with identical schema and zero downtime:
+```env
+# backend/.env
+GEMINI_API_KEY=your_gemini_api_key
+
+# PostgreSQL Connection (via standard URI or individual parameters):
+DATABASE_URL=postgresql://postgres:password@localhost:5432/mgh_logistics
+# or
+PGUSER=postgres
+PGPASSWORD=your_password
+PGHOST=localhost
+PGPORT=5432
+PGDATABASE=postgres
+```
+
+---
+
+### 4.4 Running Test Suite
 ```bash
-# Run all 20 data quality, heuristic, smoke, and SPA serving tests
-pytest backend/test_data_service.py backend/test_api_smoke.py -v
+# Run all 23 data quality, heuristic, smoke, and database tests
+pytest backend/ -v
 ```
 
 ---
