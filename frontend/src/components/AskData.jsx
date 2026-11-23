@@ -4,8 +4,8 @@ import { askData } from '../api';
 
 const SAMPLE_QUESTIONS = [
   "Which carrier is delayed the most?",
+  "Which carrier is delayed the least?",
   "What are the top 5 trade lanes?",
-  "What is the on-time rate by mode?",
   "Tell me about shipment S00158545",
 ];
 

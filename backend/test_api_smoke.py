@@ -97,6 +97,26 @@ def test_smoke_ask_carrier_delayed():
     print("Engine:", data["engine"])
 
 
+def test_smoke_ask_least_delayed_carrier():
+    """Verify POST /api/ask with question 'least delayed carrier' identifies CMA CGM (0.82d delay)."""
+    payload = {"question": "least delayed carrier"}
+    response = client.post("/api/ask", json=payload)
+    assert response.status_code == 200
+    data = response.json()
+    assert "CMA CGM" in data["answer"]
+    assert "0.82" in data["answer"]
+
+
+def test_smoke_ask_specific_carrier():
+    """Verify POST /api/ask for specific carrier 'tell me about Maersk' returns exact metrics."""
+    payload = {"question": "tell me about Maersk"}
+    response = client.post("/api/ask", json=payload)
+    assert response.status_code == 200
+    data = response.json()
+    assert "MAERSK" in data["answer"]
+    assert "53.97%" in data["answer"]
+
+
 def test_smoke_frontend_serving():
     """Verify GET / returns HTTP 200 with HTML when frontend is built."""
     response = client.get("/")

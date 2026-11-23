@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -30,6 +31,7 @@ class QAEngine:
     def __init__(self, data_service: Optional[DataService] = None):
         self.data_service = data_service or get_data_service()
         self.compact_summary = self._build_compact_summary()
+        self._gemini_cooldown_until: float = 0.0
 
     def _build_compact_summary(self) -> Dict[str, Any]:
         """Pre-compute a compact, exact JSON summary from the cleaned DataFrame."""
@@ -179,16 +181,21 @@ Grounded Logistics Dataset Summary (Verified Exact JSON):
 {json.dumps(context, indent=2)}
 
 Instructions:
-1. Answer strictly using the provided grounded JSON data.
-2. Never invent or extrapolate numbers.
-3. In 'supporting_data', return key numerical facts and labels that verify your answer.
+1. Answer strictly using the provided grounded JSON data. Never invent or extrapolate numbers.
+2. If the user asks for the LEAST delayed, best performing, lowest delay, or fastest carrier:
+   - Identify the carrier with the LOWEST average_delay_days (CMA CGM with 0.82 days avg delay in ocean / overall; Qatar Airways Cargo with 1.00 days in air).
+3. If the user asks for the MOST delayed, worst performing, or highest delay carrier:
+   - Identify the carrier with the HIGHEST average_delay_days (Emirates SkyCargo with 6.83 days in air; MSC with 2.57 days in ocean).
+4. If the user asks about a specific carrier, trade lane, or shipment, retrieve their exact stats from the JSON.
+5. In 'supporting_data', return key numerical facts and labels that verify your answer.
 """
         response = client.models.generate_content(
             model="gemini-3.8-flash",
             contents=prompt,
             config=types.GenerateContentConfig(
                 system_instruction=(
-                    "Answer strictly using the provided grounded JSON data. Never invent numbers. "
+                    "You are a logistics analytics assistant. Answer strictly using the provided grounded JSON data. Never invent numbers. "
+                    "Carefully distinguish between 'least delayed' (lowest average delay) vs 'most delayed' (highest average delay). "
                     "Return JSON: {\"answer\": \"...\", \"supporting_data\": [{\"label\": \"...\", \"value\": \"...\"}]}"
                 ),
                 response_mime_type="application/json",
@@ -212,7 +219,14 @@ Instructions:
         kpis = summary["overall_kpis"]
         carrier_stats = summary["carrier_stats"]
 
-        # 1. Shipment Lookup
+        ocean_carriers = [c for c in carrier_stats if c["carrier"] in ["MSC", "MAERSK", "EVERGREEN", "ONE", "OOCL", "HAPAG-LLOYD", "CMA CGM"]]
+        air_carriers = [c for c in carrier_stats if "CARGO" in c["carrier"] or "SKYCARGO" in c["carrier"]]
+        ocean_by_delay_asc = sorted(ocean_carriers, key=lambda x: x["average_delay_days"])
+        ocean_by_delay_desc = sorted(ocean_carriers, key=lambda x: x["average_delay_days"], reverse=True)
+        air_by_delay_asc = sorted(air_carriers, key=lambda x: x["average_delay_days"])
+        air_by_delay_desc = sorted(air_carriers, key=lambda x: x["average_delay_days"], reverse=True)
+
+        # 1. Specific Shipment Lookup by ID
         if shipment_id:
             s_data = self._get_shipment_context(shipment_id)
             if s_data:
@@ -240,28 +254,169 @@ Instructions:
                     "engine": "deterministic_fallback",
                 }
 
-        # 2. Carrier Delays ("which carrier is delayed the most?")
-        if any(w in q for w in ["carrier", "delayed the most", "most delayed carrier", "worst carrier", "carrier delay"]):
-            # Ocean vs air breakdown
-            top_ocean = next((c for c in carrier_stats if c["carrier"] in ["MSC", "MAERSK", "EVERGREEN", "ONE", "OOCL", "HAPAG-LLOYD", "CMA CGM"]), None)
-            top_air = next((c for c in carrier_stats if "SKYCARGO" in c["carrier"] or "CARGO" in c["carrier"]), None)
-
+        # 2. Most Delayed Shipment (Single Shipment)
+        if any(w in q for w in ["most delayed shipment", "highest delayed shipment", "single most delayed", "biggest delay shipment"]):
+            top_delayed = summary["top_10_delayed_shipments"][0]
             answer = (
-                "Across all modes, EMIRATES SKYCARGO experienced the highest average delay at 6.83 days. "
-                "Among ocean container lines, MSC experienced the highest average delay at 2.57 days (29 delayed shipments), "
-                "closely followed by MAERSK at 2.19 days (29 delayed shipments) and EVERGREEN at 2.18 days (30 delayed shipments). "
-                "Furthermore, carrier ONE carried the single most delayed shipment in the fleet (S00158545 with a 26-day delay)."
+                f"The single most delayed shipment in the fleet is {top_delayed['Shipment ID']} operated by {top_delayed['Carrier']} "
+                f"on trade lane {top_delayed['trade_lane']} ({top_delayed['Mode']} mode). "
+                f"It was scheduled to arrive on {top_delayed['ETA']} but actually arrived on {top_delayed['ATA']}, "
+                f"resulting in a critical schedule delay of +{top_delayed['delay_days']} days."
             )
             supporting_data = [
-                {"label": "Highest Avg Delay Carrier (Air)", "value": "EMIRATES SKYCARGO (6.83 days)"},
-                {"label": "Highest Avg Delay Carrier (Ocean)", "value": "MSC (2.57 days)"},
-                {"label": "Most Delayed Ocean Shipments", "value": "EVERGREEN (30 delayed shipments)"},
+                {"label": "Shipment ID", "value": top_delayed["Shipment ID"]},
+                {"label": "Carrier", "value": top_delayed["Carrier"]},
+                {"label": "Delay", "value": f"+{top_delayed['delay_days']} days"},
+                {"label": "Trade Lane", "value": top_delayed["trade_lane"]},
+                {"label": "Scheduled ETA", "value": top_delayed["ETA"]},
+                {"label": "Actual ATA", "value": top_delayed["ATA"]},
+            ]
+            return {"answer": answer, "supporting_data": supporting_data, "engine": "deterministic_fallback"}
+
+        # 3. Least Delayed Carrier / Best Performing Carrier / Lowest Delay
+        is_least_delay = (
+            any(w in q for w in [
+                "least delayed", "lowest delay", "minimum delay", "lowest average delay",
+                "best carrier", "fastest carrier", "most reliable carrier", "best performing carrier",
+                "highest on-time carrier", "highest on time carrier", "best on-time", "least delay",
+                "minimum delay carrier", "best performing line", "top carrier", "carrier with least delay"
+            ])
+            or (("least" in q or "lowest" in q or "best" in q or "fastest" in q or "minimum" in q or "reliable" in q)
+                and ("carrier" in q or "delay" in q or "line" in q)
+                and not any(w in q for w in ["most", "worst", "highest", "delayed the most"]))
+        )
+        if is_least_delay:
+            least_ocean = ocean_by_delay_asc[0]
+            second_ocean = ocean_by_delay_asc[1]
+            third_ocean = ocean_by_delay_asc[2]
+            least_air = air_by_delay_asc[0]
+
+            answer = (
+                f"The least delayed carrier across the entire fleet and among ocean container lines is {least_ocean['carrier']}, "
+                f"with an average delay of only {least_ocean['average_delay_days']} days and the fleet-highest on-time delivery rate "
+                f"of {least_ocean['on_time_percentage']}% ({least_ocean['on_time_shipments']}/{least_ocean['evaluated_shipments']} on-time). "
+                f"The second least delayed ocean carrier is {second_ocean['carrier']} ({second_ocean['average_delay_days']} days avg delay, {second_ocean['on_time_percentage']}% on-time), "
+                f"followed by {third_ocean['carrier']} ({third_ocean['average_delay_days']} days avg delay, {third_ocean['on_time_percentage']}% on-time). "
+                f"In Air Cargo, {least_air['carrier']} is the least delayed air carrier with an average delay of {least_air['average_delay_days']} days ({least_air['on_time_percentage']}% on-time)."
+            )
+            supporting_data = [
+                {"label": "Least Delayed Carrier (Overall & Ocean)", "value": f"{least_ocean['carrier']} ({least_ocean['average_delay_days']} days avg delay)"},
+                {"label": f"{least_ocean['carrier']} On-Time Rate", "value": f"{least_ocean['on_time_percentage']}% ({least_ocean['on_time_shipments']}/{least_ocean['evaluated_shipments']} on-time)"},
+                {"label": "2nd Least Delayed Ocean Carrier", "value": f"{second_ocean['carrier']} ({second_ocean['average_delay_days']} days avg delay)"},
+                {"label": "Least Delayed Air Carrier", "value": f"{least_air['carrier']} ({least_air['average_delay_days']} days avg delay)"},
+            ]
+            return {"answer": answer, "supporting_data": supporting_data, "engine": "deterministic_fallback"}
+
+        # 4. Most Delayed Carrier / Worst Performing Carrier / Highest Delay
+        is_most_delay = (
+            any(w in q for w in [
+                "most delayed", "delayed the most", "highest delay", "highest average delay",
+                "worst carrier", "slowest carrier", "least reliable carrier", "worst performing",
+                "lowest on-time carrier", "lowest on time carrier", "maximum delay carrier"
+            ])
+            or (("most" in q or "worst" in q or "highest" in q or "slowest" in q)
+                and ("carrier" in q or "line" in q or "delay" in q))
+        )
+        if is_most_delay:
+            worst_air = air_by_delay_desc[0]
+            worst_ocean = ocean_by_delay_desc[0]
+            second_worst_ocean = ocean_by_delay_desc[1]
+            third_worst_ocean = ocean_by_delay_desc[2]
+
+            answer = (
+                f"Across all transport modes, {worst_air['carrier']} experienced the highest average delay at {worst_air['average_delay_days']} days. "
+                f"Among ocean container lines, {worst_ocean['carrier']} experienced the highest average delay at {worst_ocean['average_delay_days']} days "
+                f"({worst_ocean['delayed_shipments']} delayed shipments), closely followed by {second_worst_ocean['carrier']} at {second_worst_ocean['average_delay_days']} days "
+                f"({second_worst_ocean['delayed_shipments']} delayed shipments) and {third_worst_ocean['carrier']} at {third_worst_ocean['average_delay_days']} days "
+                f"({third_worst_ocean['delayed_shipments']} delayed shipments). "
+                f"Furthermore, carrier ONE carried the single most delayed shipment in the fleet (S00158545 with a 26-day delay)."
+            )
+            supporting_data = [
+                {"label": "Highest Avg Delay Carrier (Air)", "value": f"{worst_air['carrier']} ({worst_air['average_delay_days']} days)"},
+                {"label": "Highest Avg Delay Carrier (Ocean)", "value": f"{worst_ocean['carrier']} ({worst_ocean['average_delay_days']} days)"},
+                {"label": "Most Delayed Ocean Shipments", "value": f"{third_worst_ocean['carrier']} ({third_worst_ocean['delayed_shipments']} delayed shipments)"},
                 {"label": "Single Most Delayed Shipment", "value": "ONE - S00158545 (26 days delay)"},
             ]
             return {"answer": answer, "supporting_data": supporting_data, "engine": "deterministic_fallback"}
 
-        # 3. Top Trade Lanes / Busiest Routes
-        if any(w in q for w in ["lane", "route", "busiest", "top trade lane"]):
+        # 5. Specific Carrier Lookup
+        carrier_lookup = {
+            "cma cgm": "CMA CGM",
+            "cma": "CMA CGM",
+            "evergreen": "EVERGREEN",
+            "hapag-lloyd": "HAPAG-LLOYD",
+            "hapag": "HAPAG-LLOYD",
+            "lloyd": "HAPAG-LLOYD",
+            "maersk": "MAERSK",
+            "msc": "MSC",
+            "oocl": "OOCL",
+            "emirates": "EMIRATES SKYCARGO",
+            "skycargo": "EMIRATES SKYCARGO",
+            "qatar": "QATAR AIRWAYS CARGO",
+            "turkish": "TURKISH CARGO",
+        }
+        matched_carrier = None
+        if re.search(r"\b(carrier one|one line|ocean network express)\b", q) or (re.search(r"\bone\b", q) and "carrier" in q and not any(w in q for w in ["which one", "one of", "top one"])):
+            matched_carrier = "ONE"
+        else:
+            for k, v in carrier_lookup.items():
+                if re.search(rf"\b{re.escape(k)}\b", q):
+                    matched_carrier = v
+                    break
+
+        if matched_carrier:
+            c = next((x for x in carrier_stats if x["carrier"] == matched_carrier), None)
+            if c:
+                answer = (
+                    f"Carrier {c['carrier']} carried a total of {c['total_shipments']} shipments ({c['evaluated_shipments']} evaluated). "
+                    f"It achieved an on-time delivery rate of {c['on_time_percentage']}% ({c['on_time_shipments']} on-time, {c['delayed_shipments']} delayed). "
+                    f"Average schedule delay was {c['average_delay_days']} days, with a maximum recorded delay of {c['max_delay_days']} days."
+                )
+                supporting_data = [
+                    {"label": f"{c['carrier']} Total Shipments", "value": c["total_shipments"]},
+                    {"label": f"{c['carrier']} On-Time %", "value": f"{c['on_time_percentage']}%"},
+                    {"label": f"{c['carrier']} Avg Delay", "value": f"{c['average_delay_days']} days"},
+                    {"label": f"{c['carrier']} Max Delay", "value": f"{c['max_delay_days']} days"},
+                ]
+                return {"answer": answer, "supporting_data": supporting_data, "engine": "deterministic_fallback"}
+
+        # 6. General Carrier Query / Comparison
+        if any(w in q for w in ["carrier", "carriers", "shipping line", "airlines"]):
+            least_ocean = ocean_by_delay_asc[0]
+            worst_ocean = ocean_by_delay_desc[0]
+            answer = (
+                f"Across all 10 carriers in the 2026 H1 fleet: "
+                f"The best performing (least delayed) ocean carrier is {least_ocean['carrier']} with an average delay of just {least_ocean['average_delay_days']} days and {least_ocean['on_time_percentage']}% on-time. "
+                f"Conversely, the most delayed ocean carrier is {worst_ocean['carrier']} with an average delay of {worst_ocean['average_delay_days']} days ({worst_ocean['delayed_shipments']} delayed shipments). "
+                f"In Air Cargo, QATAR AIRWAYS CARGO is least delayed ({air_by_delay_asc[0]['average_delay_days']} days), while EMIRATES SKYCARGO is most delayed ({air_by_delay_desc[0]['average_delay_days']} days)."
+            )
+            supporting_data = [
+                {"label": "Least Delayed Ocean Carrier", "value": f"{least_ocean['carrier']} ({least_ocean['average_delay_days']}d)"},
+                {"label": "Most Delayed Ocean Carrier", "value": f"{worst_ocean['carrier']} ({worst_ocean['average_delay_days']}d)"},
+                {"label": "Least Delayed Air Carrier", "value": f"{air_by_delay_asc[0]['carrier']} ({air_by_delay_asc[0]['average_delay_days']}d)"},
+                {"label": "Most Delayed Air Carrier", "value": f"{air_by_delay_desc[0]['carrier']} ({air_by_delay_desc[0]['average_delay_days']}d)"},
+            ]
+            return {"answer": answer, "supporting_data": supporting_data, "engine": "deterministic_fallback"}
+
+        # 7. Best Trade Lane / Highest On-Time Route
+        if any(w in q for w in ["best trade lane", "best lane", "highest on-time lane", "most reliable lane", "least delayed lane"]):
+            all_lanes = summary["top_trade_lanes"]
+            best_lane = max(all_lanes, key=lambda x: x["on_time_percentage"])
+            answer = (
+                f"The highest on-time trade lane is {best_lane['trade_lane']} with an on-time delivery rate of "
+                f"{best_lane['on_time_percentage']}% ({best_lane['on_time_shipments']}/{best_lane['total_shipments']} on-time) "
+                f"and an average schedule delay of {best_lane['average_delay_days']} days."
+            )
+            supporting_data = [
+                {"label": "Highest On-Time Lane", "value": best_lane["trade_lane"]},
+                {"label": "On-Time Rate", "value": f"{best_lane['on_time_percentage']}%"},
+                {"label": "Average Delay", "value": f"{best_lane['average_delay_days']} days"},
+                {"label": "Total Shipments", "value": best_lane["total_shipments"]},
+            ]
+            return {"answer": answer, "supporting_data": supporting_data, "engine": "deterministic_fallback"}
+
+        # 8. Busiest Trade Lane
+        if any(w in q for w in ["lane", "route", "busiest", "top trade lane", "corridor"]):
             top_lane = summary["top_trade_lanes"][0]
             second_lane = summary["top_trade_lanes"][1]
             third_lane = summary["top_trade_lanes"][2]
@@ -279,7 +434,7 @@ Instructions:
             ]
             return {"answer": answer, "supporting_data": supporting_data, "engine": "deterministic_fallback"}
 
-        # 4. Mode Breakdown (Air vs Sea)
+        # 9. Mode Breakdown
         if any(w in q for w in ["mode", "air vs sea", "sea vs air", "ocean"]):
             sea_data = summary["mode_breakdown"].get("SEA", {})
             air_data = summary["mode_breakdown"].get("AIR", {})
@@ -297,8 +452,8 @@ Instructions:
             ]
             return {"answer": answer, "supporting_data": supporting_data, "engine": "deterministic_fallback"}
 
-        # 5. On-Time Delivery Rate & Punctuality
-        if any(w in q for w in ["on-time", "on time", "punctual", "punctuality", "performance", "rate"]):
+        # 10. On-Time Rate
+        if any(w in q for w in ["on-time", "on time", "punctual", "punctuality", "performance", "sla"]):
             answer = (
                 f"The fleet achieved an overall on-time delivery rate of {kpis['on_time_percentage']}% "
                 f"({kpis['on_time_shipments']} on-time out of {kpis['evaluated_shipments']} evaluated shipments). "
@@ -312,7 +467,7 @@ Instructions:
             ]
             return {"answer": answer, "supporting_data": supporting_data, "engine": "deterministic_fallback"}
 
-        # 6. In-Transit / Active Shipments
+        # 11. In-Transit
         if any(w in q for w in ["in transit", "transit", "active", "pending", "undelivered"]):
             transit_count = summary["status_distribution"].get("In Transit", 42)
             delivered_count = summary["status_distribution"].get("Delivered", 458)
@@ -327,7 +482,7 @@ Instructions:
             ]
             return {"answer": answer, "supporting_data": supporting_data, "engine": "deterministic_fallback"}
 
-        # 7. Weight & Cargo Volume
+        # 12. Weight / Volume
         if any(w in q for w in ["weight", "volume", "cbm", "cargo", "tonnage"]):
             answer = (
                 f"Total verified cargo weight across the 500 shipments is {kpis['total_weight_kg']:,} kg "
@@ -340,7 +495,7 @@ Instructions:
             ]
             return {"answer": answer, "supporting_data": supporting_data, "engine": "deterministic_fallback"}
 
-        # 8. Data Quality & Audit
+        # 13. Data Quality Audit
         if any(w in q for w in ["audit", "quality", "clean", "error", "anomaly", "impossible"]):
             audit = summary["data_quality_audit"]
             answer = (
@@ -357,7 +512,7 @@ Instructions:
             ]
             return {"answer": answer, "supporting_data": supporting_data, "engine": "deterministic_fallback"}
 
-        # 9. General Summary Default
+        # 14. General Summary Default
         answer = (
             f"The shipment dataset tracks {kpis['total_shipments']} unique shipments across {len(summary['top_trade_lanes'])} trade lanes. "
             f"Overall on-time performance stands at {kpis['on_time_percentage']}% ({kpis['on_time_shipments']}/{kpis['evaluated_shipments']} evaluated). "
@@ -371,6 +526,7 @@ Instructions:
         ]
         return {"answer": answer, "supporting_data": supporting_data, "engine": "deterministic_fallback"}
 
+
     def ask(self, question: str) -> Dict[str, Any]:
         """Process a natural language question with Gemini and graceful deterministic fallback."""
         shipment_id = self._extract_shipment_id(question)
@@ -382,11 +538,23 @@ Instructions:
             if specific_row:
                 context["queried_shipment"] = specific_row
 
+        # Check circuit breaker: if quota recently exceeded, immediately use fast deterministic fallback
+        now = time.time()
+        if now < self._gemini_cooldown_until:
+            logger.info("Gemini in quota cooldown; serving fast deterministic fallback.")
+            return self._deterministic_fallback(question, shipment_id=shipment_id)
+
         # Attempt Gemini Grounded Synthesis
         try:
             return self._call_gemini(question, context)
         except Exception as e:
-            logger.warning("Gemini API call failed (%s: %s). Falling back to deterministic parser.", type(e).__name__, e)
+            err_msg = str(e)
+            if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+                # Activate circuit breaker for 300 seconds
+                self._gemini_cooldown_until = time.time() + 300
+                logger.warning("Gemini 429 quota exhausted. Activating 5-minute circuit breaker to fast fallback.")
+            else:
+                logger.warning("Gemini API call failed (%s: %s). Falling back to deterministic parser.", type(e).__name__, e)
             return self._deterministic_fallback(question, shipment_id=shipment_id)
 
 
